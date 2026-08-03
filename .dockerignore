@@ -1,0 +1,43 @@
+# The runtime stage copies the whole tree, so this file is what keeps the image
+# small and free of things it must not carry. Everything the application needs
+# at run time — src/, public/, db/migrations/, package.json — is deliberately
+# absent from this list.
+
+# Version control and CI
+.git
+.github
+.gitignore
+.gitattributes
+
+# Build inputs that are not runtime inputs
+Dockerfile
+.dockerignore
+node_modules
+coverage
+
+# Deploy-time assets: the cluster and the pipeline read these from the repo,
+# never from inside the image.
+.udap
+infra
+k8s
+modules
+
+# Tests and tooling config
+test
+__tests__
+eslint.config.mjs
+.prettierignore
+.prettierrc.json
+.eslintcache
+.trivyignore
+.gitleaks.toml
+
+# Docs
+*.md
+
+# Secrets and scanner output must never be baked in
+.env
+.env.*
+sbom-*.json
+licenses.csv
+*.sarif

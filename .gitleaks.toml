@@ -1,0 +1,13 @@
+title = "UDAP Node.js on EKS blueprint"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Paths whose high-entropy strings are not credentials"
+paths = [
+  # npm integrity hashes.
+  '''package-lock\.json''',
+  # Hand-drawn SVG diagram — no secrets, but plenty of long path data.
+  '''\.udap/docs/screenshot\.svg''',
+]

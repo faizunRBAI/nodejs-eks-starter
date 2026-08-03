@@ -1,0 +1,7 @@
+#!/bin/sh
+# Migration entry point — invoked by the db-migrate Kubernetes Job.
+#
+# This file is the seam the blueprint documents: swap the exec line to use
+# Prisma, Knex, Drizzle, Flyway or psql without touching the pipeline or the
+# Job manifest. The default runs the plain-SQL runner in src/migrate.js.
+exec node src/migrate.js

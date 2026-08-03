@@ -1,0 +1,704 @@
+version: 1
+name: nodejs-eks
+vcs: github
+
+# Delivery pipeline for the Node.js on EKS blueprint.
+#
+# Shape: seven quality and security gates run in parallel and all of them must
+# pass before a single AWS resource is touched. Infrastructure comes up, the
+# image is built and scanned, then the cluster is configured and verified.
+#
+# Rendered CI files are generated from this spec — never edit
+# .github/workflows/* by hand.
+
+stages:
+  # ── Gates (parallel, no cloud access) ───────────────────────────────────────
+
+  - id: lint
+    kind: lint
+    needs: []
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install dependencies
+        # Neither `cache: npm` above nor a bare `npm ci` here, because both
+        # hard-fail when package-lock.json is absent — and a freshly generated
+        # project often has none, since nothing in the generation phase can run
+        # npm to produce one. With a lockfile the install is reproducible;
+        # without one it still works, and says so.
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "::warning::No package-lock.json — installing from package.json. Run 'npm install' locally and commit the lockfile so builds are reproducible."
+            npm install --no-audit --no-fund
+          fi
+      - name: Coding standards
+        # ESLint is the Node.js equivalent of a Checkstyle gate: it enforces the
+        # project's coding rules and fails the build on any violation, including
+        # warnings. Fix with `npm run lint -- --fix`.
+        run: npx eslint . --max-warnings=0
+      - name: Formatting
+        # Advisory on purpose. Formatting is cosmetic, and blocking a production
+        # deploy on a misplaced space costs more than it saves — the fix is one
+        # command, printed below. Drop the `|| { … }` wrapper to make it a hard
+        # gate once your team runs `npm run format` before every commit.
+        run: |
+          if ! npx prettier --check "**/*.{js,mjs,json}"; then
+            echo "::warning::Some files are not formatted. Run 'npm run format' and commit the result."
+          fi
+
+  - id: test
+    kind: test
+    needs: []
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install dependencies
+        # Neither `cache: npm` above nor a bare `npm ci` here, because both
+        # hard-fail when package-lock.json is absent — and a freshly generated
+        # project often has none, since nothing in the generation phase can run
+        # npm to produce one. With a lockfile the install is reproducible;
+        # without one it still works, and says so.
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "::warning::No package-lock.json — installing from package.json. Run 'npm install' locally and commit the lockfile so builds are reproducible."
+            npm install --no-audit --no-fund
+          fi
+      - name: Unit tests
+        run: npm test
+
+  - id: sast
+    kind: security
+    needs: []
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Semgrep
+        run: pip install --quiet "semgrep>=1.90,<2"
+      - name: Static application security testing
+        # Deliberately NOT --error: the scan always exits 0 so the report is
+        # written and uploaded, and the separate gate step below decides. With
+        # --error the job died before the artifact existed and before anything
+        # readable reached the log, which is the worst possible failure mode for
+        # a security gate.
+        run: |
+          semgrep scan \
+            --config p/default \
+            --config p/owasp-top-ten \
+            --config p/javascript \
+            --severity ERROR \
+            --sarif --output semgrep.sarif \
+            --metrics off \
+            .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-sast
+          path: semgrep.sarif
+          retention-days: 30
+      - name: Fail on SAST findings
+        run: |
+          COUNT="$(jq '[.runs[]?.results[]?] | length' semgrep.sarif)"
+          echo "Semgrep ERROR-severity findings: ${COUNT}"
+          if [ "$COUNT" -gt 0 ]; then
+            jq -r '.runs[].results[]
+                   | "\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)\n  rule: \(.ruleId)\n  \(.message.text | split("\n")[0])\n"' \
+              semgrep.sarif
+            echo "::error::Semgrep found ${COUNT} blocking finding(s). Fix them, or annotate a genuinely accepted one with '// nosemgrep: <rule-id>' plus the reason."
+            exit 1
+          fi
+
+  - id: secrets_scan
+    kind: security
+    needs: []
+    steps:
+      - name: Install Gitleaks
+        # --fail matters: without it curl writes the 404 page to the tarball and
+        # the failure surfaces three lines later as an unreadable tar error.
+        run: |
+          mkdir -p bin
+          curl --fail -sSL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz"
+          tar -xzf gitleaks.tar.gz -C bin gitleaks
+          chmod +x bin/gitleaks
+          ./bin/gitleaks version
+      - name: Secret scanning
+        # --exit-code 0 so the report is always written and uploaded; the gate
+        # step below is what fails the job. Findings are redacted so the scan
+        # itself never becomes the leak.
+        run: |
+          ./bin/gitleaks dir . \
+            --config .gitleaks.toml \
+            --redact \
+            --exit-code 0 \
+            --report-format sarif \
+            --report-path gitleaks.sarif
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks.sarif
+          retention-days: 30
+      - name: Fail on leaked secrets
+        run: |
+          COUNT="$(jq '[.runs[]?.results[]?] | length' gitleaks.sarif)"
+          echo "Gitleaks findings: ${COUNT}"
+          if [ "$COUNT" -gt 0 ]; then
+            jq -r '.runs[].results[]
+                   | "\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)  \(.ruleId)"' \
+              gitleaks.sarif
+            echo "::error::Gitleaks found ${COUNT} candidate secret(s). Rotate anything real, then reference it as \${{ secrets.NAME }}; add a false positive to the allowlist in .gitleaks.toml."
+            exit 1
+          fi
+
+  - id: license_scan
+    kind: security
+    needs: []
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install dependencies
+        # Neither `cache: npm` above nor a bare `npm ci` here, because both
+        # hard-fail when package-lock.json is absent — and a freshly generated
+        # project often has none, since nothing in the generation phase can run
+        # npm to produce one. With a lockfile the install is reproducible;
+        # without one it still works, and says so.
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "::warning::No package-lock.json — installing from package.json. Run 'npm install' locally and commit the lockfile so builds are reproducible."
+            npm install --no-audit --no-fund
+          fi
+      - name: Licence compliance
+        # Fails when a production dependency carries a licence outside the
+        # permissive allowlist. Widen the list deliberately, with a note.
+        run: |
+          npx --yes license-checker-rseidelsohn@4 \
+            --production \
+            --excludePrivatePackages \
+            --onlyAllow "MIT;MIT-0;ISC;Apache-2.0;BSD-2-Clause;BSD-3-Clause;0BSD;Unlicense;CC0-1.0;CC-BY-4.0;BlueOak-1.0.0;Python-2.0" \
+            --csv --out licenses.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: licence-report
+          path: licenses.csv
+          retention-days: 90
+
+  - id: sbom
+    kind: security
+    needs: []
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install dependencies
+        # Neither `cache: npm` above nor a bare `npm ci` here, because both
+        # hard-fail when package-lock.json is absent — and a freshly generated
+        # project often has none, since nothing in the generation phase can run
+        # npm to produce one. With a lockfile the install is reproducible;
+        # without one it still works, and says so.
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "::warning::No package-lock.json — installing from package.json. Run 'npm install' locally and commit the lockfile so builds are reproducible."
+            npm install --no-audit --no-fund
+          fi
+      - name: Generate CycloneDX SBOM for the dependency tree
+        run: |
+          npx --yes @cyclonedx/cyclonedx-npm@1 \
+            --omit dev \
+            --output-format JSON \
+            --output-file sbom-source.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-source
+          path: sbom-source.cdx.json
+          retention-days: 90
+
+  - id: iac_scan
+    kind: security
+    needs: []
+    steps:
+      - name: Install Trivy
+        # Installed from Aqua's signed apt repository, for two reasons:
+        #
+        #  1. The upstream `curl … | sh` installer cannot be pinned reliably —
+        #     Trivy prunes old GitHub releases, so the script resolves the
+        #     version, then 404s on the asset and exits 1. A version that works
+        #     today stops installing in a few months.
+        #  2. Piping a remote script into a shell is itself an ERROR-severity
+        #     SAST finding, so the security gate blocked on its own installer.
+        #
+        # The apt repository always serves the current release.
+        run: |
+          sudo apt-get install -y --no-install-recommends wget gnupg apt-transport-https
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
+            | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends trivy
+          trivy --version
+      - name: Terraform security scan
+        # Blocking on CRITICAL only, so a newly published rule cannot stop a
+        # deploy without a human deciding first. Accepted findings live in
+        # .trivyignore with their reasons.
+        run: trivy config infra --severity CRITICAL --exit-code 1 --ignorefile .trivyignore
+      - name: Terraform security report
+        run: trivy config infra --severity HIGH,MEDIUM --exit-code 0 --ignorefile .trivyignore
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Checkov baseline
+        # Second opinion with a different rule set, advisory by design: two
+        # scanners disagree often enough that only one of them should hold the
+        # gate.
+        run: |
+          pip install --quiet "checkov>=3,<4"
+          checkov --directory infra --framework terraform --compact --soft-fail
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  - id: provision
+    kind: provision
+    needs: [lint, test, sast, secrets_scan, license_scan, sbom, iac_scan]
+    timeout_minutes: 45
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+    steps:
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Terraform init
+        working-directory: infra
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+      - name: Terraform apply
+        working-directory: infra
+        run: terraform apply -input=false -auto-approve
+
+  - id: build_push
+    kind: build_push
+    needs: [provision]
+    timeout_minutes: 20
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+    steps:
+      - name: Resolve image reference
+        # Derived from the account, region and project name rather than passed
+        # between jobs: a job output containing the project name is dropped by
+        # GitHub because that value is a secret.
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "REGISTRY=${REGISTRY}" >> "$GITHUB_ENV"
+          echo "IMAGE=${REGISTRY}/${{ secrets.PROJECT_NAME }}:${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+      - name: Log in to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+      - name: Build image
+        run: |
+          docker build \
+            --tag "$IMAGE" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            .
+      - name: Push image
+        run: docker push "$IMAGE"
+
+  - id: image_scan
+    kind: security
+    needs: [build_push]
+    timeout_minutes: 20
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+    steps:
+      - name: Install Trivy
+        # Installed from Aqua's signed apt repository, for two reasons:
+        #
+        #  1. The upstream `curl … | sh` installer cannot be pinned reliably —
+        #     Trivy prunes old GitHub releases, so the script resolves the
+        #     version, then 404s on the asset and exits 1. A version that works
+        #     today stops installing in a few months.
+        #  2. Piping a remote script into a shell is itself an ERROR-severity
+        #     SAST finding, so the security gate blocked on its own installer.
+        #
+        # The apt repository always serves the current release.
+        run: |
+          sudo apt-get install -y --no-install-recommends wget gnupg apt-transport-https
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
+            | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends trivy
+          trivy --version
+      - name: Resolve image reference
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "REGISTRY=${REGISTRY}" >> "$GITHUB_ENV"
+          echo "IMAGE=${REGISTRY}/${{ secrets.PROJECT_NAME }}:${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+      - name: Log in to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+      - name: Scan the image for vulnerabilities
+        # --ignore-unfixed keeps the gate about things you can act on: a base
+        # image CVE with no released patch is not a reason to block a deploy.
+        # The Dockerfile does the two things that keep this green — `apk upgrade`
+        # for OS packages and deleting npm from the runtime stage — so a finding
+        # here is normally a real one in your own dependencies. Record a
+        # genuinely accepted CVE in .trivyignore with its reason.
+        run: |
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 1 \
+            --scanners vuln,secret \
+            --ignorefile .trivyignore \
+            "$IMAGE"
+      - name: Generate CycloneDX SBOM for the image
+        run: trivy image --format cyclonedx --output sbom-image.cdx.json "$IMAGE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-image
+          path: sbom-image.cdx.json
+          retention-days: 90
+
+  # ── Release ─────────────────────────────────────────────────────────────────
+
+  - id: configure
+    kind: configure
+    needs: [provision, image_scan]
+    timeout_minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+    steps:
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.33.0
+      - name: Read the database connection string
+        # Read here rather than exported as a job output: GitHub silently drops
+        # job outputs whose value contains a secret, and this one does.
+        working-directory: infra
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+          DB_URL="$(terraform output -raw database_url 2>/dev/null || true)"
+          if [ -n "$DB_URL" ]; then
+            echo "::add-mask::${DB_URL}"
+          else
+            echo "No database in this configuration — the service will run stateless."
+          fi
+          echo "DB_URL=${DB_URL}" >> "$GITHUB_ENV"
+      - name: Configure cluster access
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ secrets.PROJECT_NAME }}-eks" \
+            --region "$AWS_REGION"
+      - name: Install the metrics server
+        # Supplies the CPU metrics the HorizontalPodAutoscaler scales on.
+        run: |
+          kubectl apply -f \
+            https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
+      - name: Bootstrap namespace, secret and service account
+        run: |
+          set -euo pipefail
+          NAMESPACE="${{ secrets.PROJECT_NAME }}"
+          IMAGE_TAG="${GITHUB_SHA::12}"
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          echo "NAMESPACE=${NAMESPACE}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "IMAGE=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAMESPACE}:${IMAGE_TAG}" >> "$GITHUB_ENV"
+
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+          if [ -n "${DB_URL:-}" ]; then
+            kubectl create secret generic app-database \
+              --namespace "$NAMESPACE" \
+              --from-literal=DATABASE_URL="${DB_URL}" \
+              --dry-run=client -o yaml | kubectl apply -f -
+          else
+            kubectl delete secret app-database --namespace "$NAMESPACE" --ignore-not-found
+          fi
+
+          # The migration Job runs before the Deployment, so the service account
+          # it references has to exist first.
+          sed -e "s|%%NAMESPACE%%|${NAMESPACE}|g" k8s/serviceaccount.yaml | kubectl apply -f -
+
+      - name: Run database migrations
+        # In-cluster, on the image just built, before the new Deployment is
+        # applied — the schema is ready before any new pod serves traffic, and a
+        # failed migration stops the deploy instead of half-releasing it.
+        #
+        # The wait is a poll, deliberately, not
+        # `kubectl wait --for=condition=complete`: that flag watches only the
+        # success condition, so a Job that fails in two seconds still burns the
+        # entire timeout and then reports "timed out waiting for the condition"
+        # while the real error sits in a pod log nobody printed. This checks both
+        # outcomes and prints the migration log either way.
+        run: |
+          set -euo pipefail
+          if [ -z "${DB_URL:-}" ]; then
+            echo "No database in this configuration — nothing to migrate."
+            exit 0
+          fi
+
+          kubectl delete job db-migrate -n "$NAMESPACE" --ignore-not-found --wait=true
+          sed -e "s|%%NAMESPACE%%|${NAMESPACE}|g" \
+              -e "s|%%IMAGE%%|${IMAGE}|g" \
+              k8s/db-migrate-job.yaml | kubectl apply -f -
+
+          DEADLINE=$((SECONDS + 300))
+          OUTCOME="pending"
+          while [ "$SECONDS" -lt "$DEADLINE" ]; do
+            SUCCEEDED="$(kubectl get job db-migrate -n "$NAMESPACE" -o jsonpath='{.status.succeeded}' 2>/dev/null || true)"
+            FAILED="$(kubectl get job db-migrate -n "$NAMESPACE" -o jsonpath='{.status.failed}' 2>/dev/null || true)"
+            if [ "${SUCCEEDED:-}" = "1" ]; then OUTCOME="succeeded"; break; fi
+            if [ -n "${FAILED:-}" ] && [ "${FAILED}" != "0" ]; then OUTCOME="failed"; break; fi
+            sleep 5
+          done
+
+          echo "--- migration log ---"
+          kubectl logs job/db-migrate -n "$NAMESPACE" --tail=200 || echo "(no pod log available)"
+
+          if [ "$OUTCOME" != "succeeded" ]; then
+            [ "$OUTCOME" = "pending" ] && OUTCOME="did not finish within 300s"
+            echo "--- job and pod state ---"
+            kubectl describe job db-migrate -n "$NAMESPACE" || true
+            kubectl get pods -n "$NAMESPACE" -l job-name=db-migrate -o wide || true
+            kubectl describe pods -n "$NAMESPACE" -l job-name=db-migrate || true
+            echo "::error::Database migration ${OUTCOME}. The migration log and pod state are above; nothing was deployed."
+            exit 1
+          fi
+          echo "Schema is up to date."
+
+      - name: Apply Kubernetes manifests
+        run: |
+          set -euo pipefail
+          for manifest in k8s/*.yaml; do
+            # The migration Job was applied by the previous step; re-applying it
+            # here would start a second run of it.
+            case "$(basename "$manifest")" in
+              db-migrate-job.yaml) continue ;;
+            esac
+            sed -e "s|%%NAMESPACE%%|${NAMESPACE}|g" \
+                -e "s|%%IMAGE_TAG%%|${IMAGE_TAG}|g" \
+                -e "s|%%IMAGE%%|${IMAGE}|g" \
+                "$manifest" | kubectl apply -f -
+          done
+      - name: Wait for the rollout
+        # `kubectl rollout status` says only "error: timed out waiting for the
+        # condition" when pods never become ready, and the reason — a failing
+        # readiness probe, an unreachable database, an image that will not pull —
+        # is only visible in state this step has to go and fetch.
+        run: |
+          set -uo pipefail
+          NS="${{ secrets.PROJECT_NAME }}"
+          if kubectl rollout status deployment/api --namespace "$NS" --timeout=10m; then
+            exit 0
+          fi
+          echo "--- pods ---"
+          kubectl get pods -n "$NS" -l app.kubernetes.io/name=api -o wide || true
+          echo "--- why the pods are not ready ---"
+          kubectl describe pods -n "$NS" -l app.kubernetes.io/name=api \
+            | grep -A 12 -E "Conditions:|Events:|State:|Last State:" || true
+          echo "--- application log ---"
+          kubectl logs -n "$NS" -l app.kubernetes.io/name=api --tail=100 --all-containers || true
+          echo "--- namespace events ---"
+          kubectl get events -n "$NS" --sort-by=.lastTimestamp | tail -25 || true
+          echo "::error::The Deployment never became ready. A pod that answers /health but fails /ready is usually the database connection — check the application log above."
+          exit 1
+
+  - id: verify
+    kind: verify
+    needs: [provision, configure]
+    timeout_minutes: 20
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+    steps:
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.33.0
+      - name: Wait for the load balancer
+        run: |
+          set -euo pipefail
+          NAMESPACE="${{ secrets.PROJECT_NAME }}"
+          aws eks update-kubeconfig --name "${NAMESPACE}-eks" --region "$AWS_REGION"
+          HOST=""
+          for _ in $(seq 1 40); do
+            # A network load balancer reports a hostname; an IP-target load
+            # balancer reports .ip. Read both, or the wait times out on a
+            # service that is actually ready.
+            HOST="$(kubectl get svc api -n "$NAMESPACE" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+            if [ -z "$HOST" ]; then
+              HOST="$(kubectl get svc api -n "$NAMESPACE" \
+                -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+            fi
+            if [ -n "$HOST" ]; then break; fi
+            sleep 15
+          done
+          if [ -z "$HOST" ]; then
+            echo "The load balancer never reported an address after 10 minutes."
+            echo "--- service ---"
+            kubectl describe svc api -n "$NAMESPACE" || true
+            echo "--- events (the cloud controller reports subnet and quota problems here) ---"
+            kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp | tail -25 || true
+            echo "::error::No load balancer address. Usual causes: the public subnets lost their kubernetes.io/role/elb tag, or the account is at its load balancer quota."
+            exit 1
+          fi
+          echo "Load balancer address: ${HOST}"
+          echo "APP_URL=http://${HOST}" >> "$GITHUB_ENV"
+      - name: Health check
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 40); do
+            CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "${APP_URL}/health" || true)"
+            if [ "$CODE" = "200" ]; then
+              echo "Service is healthy at ${APP_URL}"
+              curl -sS --max-time 10 "${APP_URL}/api/info" || true
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "The service never returned 200 from /health in 10 minutes."
+          echo "--- pods ---"
+          kubectl get pods -n "${{ secrets.PROJECT_NAME }}" -o wide || true
+          echo "--- application log ---"
+          kubectl logs -n "${{ secrets.PROJECT_NAME }}" -l app.kubernetes.io/name=api --tail=100 || true
+          echo "--- endpoints (empty means no pod passed its readiness probe) ---"
+          kubectl get endpoints api -n "${{ secrets.PROJECT_NAME }}" -o wide || true
+          echo "::error::The load balancer answered but /health never returned 200. Check the application log above, and whether the readiness probe on /ready is passing."
+          exit 1
+
+  - id: notify
+    kind: notify
+    needs: [verify]
+    steps:
+      - name: Deployment summary
+        run: |
+          {
+            echo "### Deployment complete"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Cluster | \`${{ secrets.PROJECT_NAME }}-eks\` |"
+            echo "| Namespace | \`${{ secrets.PROJECT_NAME }}\` |"
+            echo "| Image tag | \`${GITHUB_SHA::12}\` |"
+            echo ""
+            echo "Security artefacts for this run: Semgrep SAST, Gitleaks, licence report,"
+            echo "dependency SBOM and image SBOM are attached to the workflow run."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+rollback:
+  strategy: manual
+
+# Teardown override. The default rendered destroy runs terraform alone, which
+# cannot work here: the load balancer is created by Kubernetes, not terraform,
+# and its presence blocks the VPC from being deleted. Remove the cluster's
+# service objects first, then destroy the stack.
+destroy:
+  steps:
+    - uses: azure/setup-kubectl@v4
+      with:
+        version: v1.33.0
+    - uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_wrapper: false
+    - name: Read the VPC id from state
+      # Terraform runs first, before any deletion, purely to learn the VPC id —
+      # the only reliable way to tell "the load balancer this project created" from
+      # every other load balancer in the account. Kubernetes names it, not
+      # Terraform, so there is no tag or name pattern to match on.
+      working-directory: infra
+      run: |
+        terraform init -input=false -reconfigure \
+          -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+          -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+          -backend-config="region=${AWS_REGION}"
+        echo "VPC_ID=$(terraform output -raw vpc_id 2>/dev/null || true)" >> "$GITHUB_ENV"
+    - name: Delete the Kubernetes load balancer
+      # This is what makes teardown work at all. The load balancer is created by
+      # Kubernetes, so Terraform has no record of it, and while it exists its
+      # security group and network interfaces hold the subnets — `terraform
+      # destroy` fails on DependencyViolation and leaves a half-destroyed stack.
+      run: |
+        NAMESPACE="${{ secrets.PROJECT_NAME }}"
+        if ! aws eks update-kubeconfig --name "${NAMESPACE}-eks" --region "$AWS_REGION" 2>/dev/null; then
+          echo "Cluster is already gone — nothing to clean up in Kubernetes."
+          exit 0
+        fi
+        kubectl delete svc --all -n "$NAMESPACE" --ignore-not-found --timeout=5m || true
+        kubectl delete namespace "$NAMESPACE" --ignore-not-found --timeout=5m || true
+
+        if [ -z "${VPC_ID:-}" ]; then
+          echo "No vpc_id in state — falling back to a fixed wait."
+          sleep 180
+          exit 0
+        fi
+
+        # Poll until nothing is left in the VPC, rather than sleeping and hoping.
+        echo "Waiting for AWS to finish deleting load balancers in ${VPC_ID}."
+        for _ in $(seq 1 40); do
+          V2="$(aws elbv2 describe-load-balancers \
+                 --query "length(LoadBalancers[?VpcId=='${VPC_ID}'])" --output text 2>/dev/null || echo 0)"
+          V1="$(aws elb describe-load-balancers \
+                 --query "length(LoadBalancerDescriptions[?VPCId=='${VPC_ID}'])" --output text 2>/dev/null || echo 0)"
+          echo "  load balancers remaining: elbv2=${V2} classic=${V1}"
+          if [ "$V2" = "0" ] && [ "$V1" = "0" ]; then
+            echo "All load balancers deleted."
+            # The network interfaces outlive the load balancer by a few seconds.
+            sleep 30
+            exit 0
+          fi
+          sleep 15
+        done
+        echo "::warning::Load balancers still present after 10 minutes; attempting the destroy anyway."
+    - name: Terraform destroy
+      working-directory: infra
+      # Retried once: a lingering network interface produces a DependencyViolation
+      # that clears itself within a minute, and a second attempt is cheaper than a
+      # half-destroyed stack somebody has to finish by hand.
+      run: |
+        # No -e: the first attempt is allowed to fail so the retry can run.
+        # init already happened in the VPC-id step, in this same directory.
+        set -uo pipefail
+        if terraform destroy -input=false -auto-approve; then
+          echo "Destroy complete."
+          exit 0
+        fi
+        echo "::warning::First destroy attempt failed — waiting 90s for dependent resources to clear, then retrying."
+        sleep 90
+        terraform destroy -input=false -auto-approve
