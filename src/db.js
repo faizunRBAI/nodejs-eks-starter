@@ -32,7 +32,7 @@ function sslConfig() {
     if (caPath) {
       try {
         return { ca: fs.readFileSync(caPath).toString() };
-      } catch (_e) {
+      } catch {
         // CA file missing — fall back to require-mode rather than crashing.
       }
     }
